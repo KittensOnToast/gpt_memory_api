@@ -3,20 +3,20 @@ from pydantic import BaseModel
 from datetime import datetime
 import uuid
 import os
-import openai
+from openai import OpenAI
 import chromadb
 
 # --- Setup OpenAI ---
-openai.api_key = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Function to get embeddings from OpenAI
 def get_embedding(text: str) -> list[float]:
     try:
-        response = openai.Embedding.create(
-            input=text,
-            model="text-embedding-ada-002"
+        response = client.embeddings.create(
+            model="text-embedding-ada-002",
+            input=text
         )
-        return response["data"][0]["embedding"]
+        return response.data[0].embedding
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Embedding error: {e}")
 
