@@ -3,34 +3,44 @@ from pydantic import BaseModel
 from datetime import datetime
 import uuid
 import os
-from openai import OpenAI
+import requests
 import chromadb
 
-# --- Setup OpenAI ---
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# --- OpenAI API settings ---
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_EMBED_URL = "https://api.openai.com/v1/embeddings"
 
-# Function to get embeddings from OpenAI
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY is not set in environment variables.")
+
+# Function to get embeddings via direct HTTP request
 def get_embedding(text: str) -> list[float]:
     try:
-        response = client.embeddings.create(
-            model="text-embedding-ada-002",
-            input=text
-        )
-        return response.data[0].embedding
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {OPENAI_API_KEY}"
+        }
+        data = {
+            "model": "text-embedding-ada-002",
+            "input": text
+        }
+        response = requests.post(OPENAI_EMBED_URL, headers=headers, json=data)
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"Embedding error: {response.text}")
+        return response.json()["data"][0]["embedding"]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Embedding error: {e}")
 
 # --- Initialize Chroma DB ---
 chroma_client = chromadb.Client()
 
-# Create collections for shared + role-specific memory
 collections = {
     "shared": chroma_client.get_or_create_collection(name="shared"),
     "personal_assistant": chroma_client.get_or_create_collection(name="personal_assistant"),
     "writing_review": chroma_client.get_or_create_collection(name="writing_review")
 }
 
-# --- API Setup ---
+# --- FastAPI App ---
 app = FastAPI(title="Custom GPT Memory API")
 
 # --- Data Models ---
@@ -79,7 +89,6 @@ def save_memory(item: MemoryItem):
 def query_memory(item: QueryItem):
     if item.role not in collections:
         raise HTTPException(status_code=400, detail="Invalid role")
-
     try:
         embedding = get_embedding(item.query)
         results = collections[item.role].query(
@@ -113,5 +122,4 @@ def delete_memory(role: str, memory_id: str):
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting memory: {e}")
-
 
