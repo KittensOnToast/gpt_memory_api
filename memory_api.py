@@ -15,25 +15,20 @@ if not openai_api_key:
 # --- Initialize Chroma DB with OpenAI Embeddings ---
 embedder = embedding_functions.OpenAIEmbeddingFunction(
     api_key=openai_api_key,
-    model_name="text-embedding-3-small"  # lightweight, cost-efficient
+    model_name="text-embedding-3-small"  # Fast & cost-effective
 )
 chroma_client = chromadb.Client()
 
-# --- Create collections ---
+# --- Collections ---
 collections = {
-    "shared": chroma_client.create_collection(
-        name="shared", embedding_function=embedder, get_or_create=True
-    ),
-    "personal_assistant": chroma_client.create_collection(
-        name="personal_assistant", embedding_function=embedder, get_or_create=True
-    ),
-    "writing_review": chroma_client.create_collection(
-        name="writing_review", embedding_function=embedder, get_or_create=True
-    )
+    "shared": chroma_client.get_or_create_collection("shared", embedding_function=embedder),
+    "personal_assistant": chroma_client.get_or_create_collection("personal_assistant", embedding_function=embedder),
+    "writing_review": chroma_client.get_or_create_collection("writing_review", embedding_function=embedder),
+    "goals": chroma_client.get_or_create_collection("goals", embedding_function=embedder)
 }
 
 # --- API Setup ---
-app = FastAPI(title="Custom GPT Memory API")
+app = FastAPI(title="Plan C Memory API")
 
 # --- Data Models ---
 class MemoryItem(BaseModel):
@@ -54,143 +49,150 @@ class UpdateItem(BaseModel):
     new_content: str
 
 class FeedbackItem(BaseModel):
+    memory_id: str
+    role: str
+    feedback: str  # "positive" or "negative"
     user_id: str
-    feedback_type: str  # "positive" or "negative"
     feedback_text: str
+
+class TagSearchItem(BaseModel):
+    role: str
+    tags: list[str]
+    top_k: int = 3
 
 class GoalItem(BaseModel):
     user_id: str
-    goal: str
+    content: str
 
-# --- Memory API Endpoints ---
+# --- Endpoints ---
 
 @app.post("/memory/save")
 def save_memory(item: MemoryItem):
-    """Save a memory entry."""
     if item.role not in collections:
         raise HTTPException(status_code=400, detail="Invalid role")
-    try:
-        mem_id = str(uuid.uuid4())
-        collections[item.role].add(
-            documents=[item.content],
-            metadatas=[{
-                "user_id": item.user_id,
-                "tags": ",".join(item.tags),
-                "created_at": datetime.utcnow().isoformat()
-            }],
-            ids=[mem_id]
-        )
-        return {"status": "success", "memory_id": mem_id}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error saving memory: {e}")
+    mem_id = str(uuid.uuid4())
+    collections[item.role].add(
+        documents=[item.content],
+        metadatas=[{
+            "user_id": item.user_id,
+            "tags": ",".join(item.tags),
+            "created_at": datetime.utcnow().isoformat()
+        }],
+        ids=[mem_id]
+    )
+    return {"status": "success", "memory_id": mem_id}
 
 @app.post("/memory/query")
 def query_memory(item: QueryItem):
-    """Query stored memory."""
     if item.role not in collections:
         raise HTTPException(status_code=400, detail="Invalid role")
-    try:
-        results = collections[item.role].query(
-            query_texts=[item.query],
-            n_results=item.top_k
-        )
-        return {"matches": results}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error querying memory: {e}")
-
-@app.post("/memory/update")
-def update_memory(item: UpdateItem):
-    """Update an existing memory entry."""
-    if item.role not in collections:
-        raise HTTPException(status_code=400, detail="Invalid role")
-    try:
-        # First, delete the old record
-        collections[item.role].delete(ids=[item.memory_id])
-        # Then, save the updated record with the same ID
-        collections[item.role].add(
-            documents=[item.new_content],
-            metadatas=[{"updated_at": datetime.utcnow().isoformat()}],
-            ids=[item.memory_id]
-        )
-        return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error updating memory: {e}")
-
-@app.delete("/memory/delete/{role}/{memory_id}")
-def delete_memory(role: str, memory_id: str):
-    """Delete a memory entry."""
-    if role not in collections:
-        raise HTTPException(status_code=400, detail="Invalid role")
-    try:
-        collections[role].delete(ids=[memory_id])
-        return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error deleting memory: {e}")
+    results = collections[item.role].query(
+        query_texts=[item.query],
+        n_results=item.top_k
+    )
+    return {"matches": results}
 
 @app.post("/memory/auto-query")
 def auto_query(item: QueryItem):
-    """Search both shared + role-specific memory for relevant info."""
-    try:
-        all_results = []
-        for role_key in ["shared", item.role]:
-            if role_key in collections:
-                result = collections[role_key].query(
-                    query_texts=[item.query],
-                    n_results=item.top_k
-                )
-                if result and result.get("documents") and result["documents"][0]:
-                    all_results.extend(result["documents"][0])
-        return {"matches": all_results}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error in auto-query: {e}")
+    all_results = []
+    for role_key in ["shared", item.role]:
+        if role_key in collections:
+            result = collections[role_key].query(
+                query_texts=[item.query],
+                n_results=item.top_k
+            )
+            if result.get("documents") and result["documents"][0]:
+                all_results.extend(result["documents"][0])
+    return {"matches": all_results}
 
-# --- Feedback Learning ---
+@app.post("/memory/update")
+def update_memory(item: UpdateItem):
+    if item.role not in collections:
+        raise HTTPException(status_code=400, detail="Invalid role")
+    collections[item.role].update(
+        ids=[item.memory_id],
+        documents=[item.new_content],
+        metadatas=[{"updated_at": datetime.utcnow().isoformat()}]
+    )
+    return {"status": "success"}
+
+@app.delete("/memory/delete/{role}/{memory_id}")
+def delete_memory(role: str, memory_id: str):
+    if role not in collections:
+        raise HTTPException(status_code=400, detail="Invalid role")
+    collections[role].delete(ids=[memory_id])
+    return {"status": "success"}
+
 @app.post("/memory/feedback")
-def store_feedback(item: FeedbackItem):
-    """Store user feedback for learning purposes."""
+def feedback_memory(item: FeedbackItem):
+    if item.role not in collections:
+        raise HTTPException(status_code=400, detail="Invalid role")
     try:
-        mem_id = str(uuid.uuid4())
-        collections["shared"].add(
-            documents=[f"Feedback: {item.feedback_type} - {item.feedback_text}"],
+        # Log feedback as new memory entry for now (can be made smarter later)
+        feedback_entry = f"FEEDBACK [{item.feedback.upper()}] — {item.feedback_text}"
+        collections[item.role].add(
+            documents=[feedback_entry],
             metadatas=[{
                 "user_id": item.user_id,
-                "feedback_type": item.feedback_type,
+                "feedback_for": item.memory_id,
+                "type": "feedback",
+                "feedback_type": item.feedback,
                 "created_at": datetime.utcnow().isoformat()
             }],
-            ids=[mem_id]
+            ids=[str(uuid.uuid4())]
         )
-        return {"status": "success", "feedback_id": mem_id}
+        return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error saving feedback: {e}")
 
-# --- Goal Tracking ---
-@app.post("/memory/goals")
-def store_goal(item: GoalItem):
-    """Store a long-term project or strategic goal."""
+@app.post("/memory/tag-search")
+def tag_search(item: TagSearchItem):
+    if item.role not in collections:
+        raise HTTPException(status_code=400, detail="Invalid role")
     try:
-        mem_id = str(uuid.uuid4())
-        collections["shared"].add(
-            documents=[f"Goal: {item.goal}"],
+        results = collections[item.role].get(include=["documents", "metadatas"])
+        filtered = [
+            doc for doc, meta in zip(results["documents"], results["metadatas"])
+            if all(tag in meta.get("tags", "") for tag in item.tags)
+        ]
+        return {"matches": filtered[:item.top_k]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error in tag search: {e}")
+
+@app.post("/memory/goals")
+def save_goal(goal: GoalItem):
+    try:
+        goal_id = str(uuid.uuid4())
+        collections["goals"].add(
+            documents=[goal.content],
             metadatas=[{
-                "user_id": item.user_id,
-                "goal": item.goal,
+                "user_id": goal.user_id,
                 "created_at": datetime.utcnow().isoformat()
             }],
-            ids=[mem_id]
+            ids=[goal_id]
         )
-        return {"status": "success", "goal_id": mem_id}
+        return {"status": "success", "goal_id": goal_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error saving goal: {e}")
 
-# --- Self-Review ---
-@app.get("/memory/self-review")
-def self_review():
-    """Evaluate recent outputs and suggest improvements."""
+@app.get("/memory/goals")
+def get_goals():
     try:
+        results = collections["goals"].get(include=["documents", "metadatas", "ids"])
         return {
-            "status": "success",
-            "review": "Recent outputs meet style and clarity standards. Focus on improving engagement section summaries."
+            "goals": [
+                {"id": goal_id, "content": doc, "metadata": meta}
+                for doc, meta, goal_id in zip(results["documents"], results["metadatas"], results["ids"])
+            ]
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error performing self-review: {e}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving goals: {e}")
+
+@app.delete("/memory/goals/{goal_id}")
+def delete_goal(goal_id: str):
+    try:
+        collections["goals"].delete(ids=[goal_id])
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deleting goal: {e}")
 
