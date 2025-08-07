@@ -155,7 +155,7 @@ def save_goal(goal: GoalItem):
     try:
         goal_id = str(uuid.uuid4())
         collections["goals"].add(
-            documents=[goal.goal],
+            documents=[goal.content],
             metadatas=[{
                 "user_id": goal.user_id,
                 "created_at": datetime.utcnow().isoformat()
