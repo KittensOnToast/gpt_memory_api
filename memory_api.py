@@ -63,7 +63,7 @@ class TagSearchItem(BaseModel):
 
 class GoalItem(BaseModel):
     user_id: str
-    goal: str
+    content: str
 
 # Endpoints
 @app.post("/memory/save")
