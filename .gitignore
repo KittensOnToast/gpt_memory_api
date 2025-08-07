@@ -1,0 +1,27 @@
+# Ignore Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+
+# Environment variables
+.env
+
+# Local data directories
+/data/
+
+# VSCode & IDE settings
+.vscode/
+.idea/
+
+# MacOS metadata
+.DS_Store
+

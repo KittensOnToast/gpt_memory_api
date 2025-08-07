@@ -1,20 +1,21 @@
-# Core API
-fastapi
-uvicorn
+# path: requirements.txt
+# Web framework
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
 
-# Database & Embeddings
-chromadb
+# Vector database & embeddings
+chromadb>=0.5.5
+openai>=1.35.0
 
-# OpenAI API
-openai
+# Config and validation
+pydantic>=2.7.0
+pydantic-settings>=2.2.1
 
-# Data validation
-pydantic
+# File parsing support
+pypdf>=4.2.0
+python-docx>=1.1.0
 
-# Optional: If using sentence-transformers instead of OpenAI embeddings
-sentence-transformers
-numpy
-
-# Other utilities
-python-dotenv
+# Utility
+typing-extensions>=4.9.0
 
