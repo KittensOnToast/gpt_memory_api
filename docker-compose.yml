@@ -1,0 +1,17 @@
+# path: docker-compose.yml
+version: "3.9"
+
+services:
+  plan-c-memory:
+    build: .
+    image: plan-c-memory:latest
+    container_name: plan-c-memory
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./data/chroma:/data/chroma
+      - ./data/files:/data/files
+    restart: unless-stopped
+
