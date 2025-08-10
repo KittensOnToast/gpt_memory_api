@@ -606,6 +606,150 @@ def delete_file(filename: str):
     if file_path.exists():
         file_path.unlink()
     return {"status": "success"}
+# --- New: upload by URL (server fetches) ---
+import requests  # top-level import already ok if added
+
+@app.post("/files/upload-by-url")
+def upload_file_by_url(user_id: str = Query(...), url: str = Query(...), filename: Optional[str] = None):
+    try:
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        data = r.content
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to download: {e}")
+
+    if len(data) > settings.MAX_FILE_SIZE_MB * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"File too large (>{settings.MAX_FILE_SIZE_MB} MB)")
+
+    # derive name
+    safe_name = _safe_filename(filename or url.split("?")[0].split("/")[-1] or f"remote_{uuid.uuid4().hex}.bin")
+    dest_path = Path(settings.FILE_STORAGE_DIR) / safe_name
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_file_encrypted(dest_path, data)
+
+    # text extraction (supports encryption)
+    try:
+        text = _read_file_encrypted(dest_path).decode("utf-8", errors="ignore")
+    except Exception:
+        text = _extract_text(dest_path)
+
+    chunks = token_chunks(text, settings.CHUNK_TOKENS, settings.CHUNK_OVERLAP_TOKENS)
+    for chunk in chunks:
+        collections["files_index"].add(
+            documents=[chunk],
+            metadatas=[{
+                "user_id": user_id,
+                "source_file": safe_name,
+                "tokens": count_tokens(chunk),
+                "created_at": datetime.utcnow().isoformat()
+            }],
+            ids=[str(uuid.uuid4())]
+        )
+
+    collections["files"].add(
+        documents=[safe_name],
+        metadatas=[{
+            "user_id": user_id,
+            "stored_path": str(dest_path),
+            "encrypted": bool(settings.CRYPTO_ENC_KEY),
+            "created_at": datetime.utcnow().isoformat()
+        }],
+        ids=[str(uuid.uuid4())]
+    )
+    return {"status": "success", "filename": safe_name, "chunks_indexed": len(chunks)}
+
+# --- New: upload base64 (Actions-friendly) ---
+@app.post("/files/upload-base64")
+def upload_file_base64(user_id: str, filename: str, content_base64: str):
+    try:
+        data = base64.b64decode(content_base64, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 content")
+
+    if len(data) > settings.MAX_FILE_SIZE_MB * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"File too large (>{settings.MAX_FILE_SIZE_MB} MB)")
+
+    safe_name = _safe_filename(filename)
+    dest_path = Path(settings.FILE_STORAGE_DIR) / safe_name
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_file_encrypted(dest_path, data)
+
+    # extract text (handle encryption)
+    try:
+        text = _read_file_encrypted(dest_path).decode("utf-8", errors="ignore")
+    except Exception:
+        text = _extract_text(dest_path)
+
+    chunks = token_chunks(text, settings.CHUNK_TOKENS, settings.CHUNK_OVERLAP_TOKENS)
+    for chunk in chunks:
+        collections["files_index"].add(
+            documents=[chunk],
+            metadatas=[{
+                "user_id": user_id,
+                "source_file": safe_name,
+                "tokens": count_tokens(chunk),
+                "created_at": datetime.utcnow().isoformat()
+            }],
+            ids=[str(uuid.uuid4())]
+        )
+
+    collections["files"].add(
+        documents=[safe_name],
+        metadatas=[{
+            "user_id": user_id,
+            "stored_path": str(dest_path),
+            "encrypted": bool(settings.CRYPTO_ENC_KEY),
+            "created_at": datetime.utcnow().isoformat()
+        }],
+        ids=[str(uuid.uuid4())]
+    )
+    return {"status": "success", "filename": safe_name, "chunks_indexed": len(chunks)}
+
+# --- New: copy indexed file text into a role memory item ---
+class SaveFileToMemoryReq(BaseModel):
+    user_id: str
+    role: str
+    filename: str
+    tags: List[str] = []
+
+@app.post("/memory/save-file")
+def save_file_to_memory(body: SaveFileToMemoryReq):
+    if body.role not in collections:
+        raise HTTPException(status_code=400, detail="Invalid role")
+
+    safe_name = _safe_filename(body.filename)
+    file_path = Path(settings.FILE_STORAGE_DIR) / safe_name
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # prefer decrypted read (works for encrypted/plain)
+    try:
+        text = _read_file_encrypted(file_path).decode("utf-8", errors="ignore")
+    except Exception:
+        text = _extract_text(file_path)
+
+    # cap the memory content to a sensible token budget to keep memory lean
+    max_tokens = 1500
+    out, used = [], 0
+    for ch in token_chunks(text, settings.CHUNK_TOKENS, settings.CHUNK_OVERLAP_TOKENS):
+        t = count_tokens(ch)
+        if used + t > max_tokens: break
+        out.append(ch)
+        used += t
+    content = f"[source_file: {safe_name}]\n\n" + "\n\n".join(out) if out else f"[source_file: {safe_name}]"
+
+    mem_id = str(uuid.uuid4())
+    collections[body.role].add(
+        documents=[content],
+        metadatas=[{
+            "user_id": body.user_id,
+            "tags": ",".join(["from_file"] + list(body.tags)),
+            "source_file": safe_name,
+            "created_at": datetime.utcnow().isoformat()
+        }],
+        ids=[mem_id]
+    )
+    return {"status": "success", "memory_id": mem_id, "tokens_stored": used}
 
 # =========================
 # Context Builder (Hybrid + Feedback rerank + Token budget)
