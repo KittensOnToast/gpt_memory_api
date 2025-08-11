@@ -657,6 +657,169 @@ def upload_file_by_url(user_id: str = Query(...), url: str = Query(...), filenam
         ids=[str(uuid.uuid4())]
     )
     return {"status": "success", "filename": safe_name, "chunks_indexed": len(chunks)}
+# --- ADD: helpers for safe HTTP fetch ---
+import io
+try:
+    import requests  # allowed in Docker build; used only for server-side fetching by URL
+except Exception:
+    requests = None
+
+def _download_http(url: str, max_mb: int) -> bytes:
+    if not requests:
+        raise HTTPException(status_code=500, detail="requests not available on server")
+    with requests.get(url, stream=True, timeout=30) as r:
+        r.raise_for_status()
+        total = 0
+        buf = io.BytesIO()
+        for chunk in r.iter_content(chunk_size=65536):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_mb * 1024 * 1024:
+                raise HTTPException(status_code=413, detail=f"File too large (>{max_mb} MB)")
+            buf.write(chunk)
+        return buf.getvalue()
+
+# --- ADD: models for base64 upload + save-file ---
+class UploadBase64Body(BaseModel):
+    user_id: str
+    filename: str
+    content_base64: str
+
+class SaveFileToMemoryBody(BaseModel):
+    user_id: str
+    role: str
+    filename: str
+    tags: List[str] = []
+
+# --- ADD: upload-by-url ---
+@app.post("/files/upload-by-url")
+def upload_file_by_url(user_id: str = Query(...), url: str = Query(...), filename: Optional[str] = Query(None)):
+    if not url.lower().startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Invalid URL")
+    raw = _download_http(url, settings.MAX_FILE_SIZE_MB)
+    name = _safe_filename(filename or url.split("/")[-1] or f"download-{uuid.uuid4().hex}")
+    dest_path = Path(settings.FILE_STORAGE_DIR) / name
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_file_encrypted(dest_path, raw)
+
+    # extract + index
+    text = ""
+    if settings.CRYPTO_ENC_KEY:
+        try:
+            text = _read_file_encrypted(dest_path).decode("utf-8", errors="ignore")
+        except Exception:
+            text = ""
+    else:
+        text = _extract_text(dest_path)
+
+    chunks = token_chunks(text, settings.CHUNK_TOKENS, settings.CHUNK_OVERLAP_TOKENS)
+    for chunk in chunks:
+        collections["files_index"].add(
+            documents=[chunk],
+            metadatas=[{
+                "user_id": user_id,
+                "source_file": name,
+                "created_at": datetime.utcnow().isoformat()
+            }],
+            ids=[str(uuid.uuid4())]
+        )
+
+    collections["files"].add(
+        documents=[name],
+        metadatas=[{
+            "user_id": user_id,
+            "stored_path": str(dest_path),
+            "encrypted": bool(settings.CRYPTO_ENC_KEY),
+            "created_at": datetime.utcnow().isoformat()
+        }],
+        ids=[str(uuid.uuid4())]
+    )
+    return {"status": "success", "filename": name, "chunks_indexed": len(chunks)}
+
+# --- ADD: upload-base64 ---
+@app.post("/files/upload-base64")
+def upload_file_base64(body: UploadBase64Body):
+    data: bytes
+    try:
+        data = base64.b64decode(body.content_base64, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64")
+
+    if len(data) > settings.MAX_FILE_SIZE_MB * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"File too large (>{settings.MAX_FILE_SIZE_MB} MB)")
+
+    safe_name = _safe_filename(body.filename or f"upload-{uuid.uuid4().hex}")
+    dest_path = Path(settings.FILE_STORAGE_DIR) / safe_name
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_file_encrypted(dest_path, data)
+
+    text = ""
+    if settings.CRYPTO_ENC_KEY:
+        try:
+            text = _read_file_encrypted(dest_path).decode("utf-8", errors="ignore")
+        except Exception:
+            text = ""
+    else:
+        text = _extract_text(dest_path)
+
+    chunks = token_chunks(text, settings.CHUNK_TOKENS, settings.CHUNK_OVERLAP_TOKENS)
+    for chunk in chunks:
+        collections["files_index"].add(
+            documents=[chunk],
+            metadatas=[{
+                "user_id": body.user_id,
+                "source_file": safe_name,
+                "created_at": datetime.utcnow().isoformat()
+            }],
+            ids=[str(uuid.uuid4())]
+        )
+
+    collections["files"].add(
+        documents=[safe_name],
+        metadatas=[{
+            "user_id": body.user_id,
+            "stored_path": str(dest_path),
+            "encrypted": bool(settings.CRYPTO_ENC_KEY),
+            "created_at": datetime.utcnow().isoformat()
+        }],
+        ids=[str(uuid.uuid4())]
+    )
+    return {"status": "success", "filename": safe_name, "chunks_indexed": len(chunks)}
+
+# --- ADD: save-file to memory (uses already-uploaded file) ---
+@app.post("/memory/save-file")
+def save_file_to_memory(body: SaveFileToMemoryBody):
+    safe_name = _safe_filename(body.filename)
+    file_path = Path(settings.FILE_STORAGE_DIR) / safe_name
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found. Upload first.")
+
+    # re-extract full text (handles encryption)
+    text = ""
+    if settings.CRYPTO_ENC_KEY:
+        try:
+            text = _read_file_encrypted(file_path).decode("utf-8", errors="ignore")
+        except Exception:
+            text = ""
+    else:
+        text = _extract_text(file_path)
+
+    if body.role not in collections:
+        raise HTTPException(status_code=400, detail="Invalid role")
+
+    mem_id = str(uuid.uuid4())
+    collections[body.role].add(
+        documents=[text],
+        metadatas=[{
+            "user_id": body.user_id,
+            "source_file": safe_name,
+            "tags": ",".join(body.tags or []),
+            "created_at": datetime.utcnow().isoformat()
+        }],
+        ids=[mem_id]
+    )
+    return {"status": "success", "memory_id": mem_id, "saved_from": safe_name}
 
 # --- New: upload base64 (Actions-friendly) ---
 @app.post("/files/upload-base64")
