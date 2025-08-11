@@ -22,6 +22,10 @@ from pypdf import PdfReader
 from docx import Document
 from openai import OpenAI
 
+import base64
+from urllib.request import urlopen, Request as UrlRequest
+from urllib.error import URLError, HTTPError
+
 # External deps for upgrades
 from rank_bm25 import BM25Okapi  # keyword retrieval
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # AES-GCM encryption
@@ -381,6 +385,50 @@ def _read_file_encrypted(path: Path) -> bytes:
         ct = data[16:]
         return _decrypt_bytes(nonce, ct)
     return data
+def _index_file_bytes(user_id: str, safe_name: str, data: bytes) -> Dict[str, Any]:
+    # Write encrypted/plain file
+    dest_path = Path(settings.FILE_STORAGE_DIR) / safe_name
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_file_encrypted(dest_path, data)
+
+    # Extract text (handle encryption)
+    text = ""
+    if settings.CRYPTO_ENC_KEY:
+        try:
+            text = _read_file_encrypted(dest_path).decode("utf-8", errors="ignore")
+        except Exception:
+            text = ""
+    else:
+        text = _extract_text(dest_path)
+
+    # Token-aware chunking + index
+    chunks = token_chunks(text, settings.CHUNK_TOKENS, settings.CHUNK_OVERLAP_TOKENS)
+    token_counts = [count_tokens(c) for c in chunks]
+    for chunk, tokc in zip(chunks, token_counts):
+        collections["files_index"].add(
+            documents=[chunk],
+            metadatas=[{
+                "user_id": user_id,
+                "source_file": safe_name,
+                "tokens": tokc,
+                "created_at": datetime.utcnow().isoformat()
+            }],
+            ids=[str(uuid.uuid4())]
+        )
+
+    # Track file record
+    collections["files"].add(
+        documents=[safe_name],
+        metadatas=[{
+            "user_id": user_id,
+            "stored_path": str(dest_path),
+            "encrypted": bool(settings.CRYPTO_ENC_KEY),
+            "created_at": datetime.utcnow().isoformat()
+        }],
+        ids=[str(uuid.uuid4())]
+    )
+
+    return {"status": "success", "filename": safe_name, "chunks_indexed": len(chunks)}
 
 def _presign(filename: str, expires_in: int) -> Dict[str, Any]:
     if not settings.DOWNLOAD_TOKEN_SECRET:
@@ -913,6 +961,95 @@ def save_file_to_memory(body: SaveFileToMemoryReq):
         ids=[mem_id]
     )
     return {"status": "success", "memory_id": mem_id, "tokens_stored": used}
+from pydantic import Field
+
+class UploadBase64Body(BaseModel):
+    user_id: str
+    filename: str
+    content_base64: str  # raw base64 of the file content
+
+@app.post("/files/upload-base64")
+def upload_file_base64(body: UploadBase64Body):
+    safe_name = _safe_filename(body.filename)
+    try:
+        raw = base64.b64decode(body.content_base64, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64")
+
+    if len(raw) > settings.MAX_FILE_SIZE_MB * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"File too large (>{settings.MAX_FILE_SIZE_MB} MB)")
+
+    return _index_file_bytes(body.user_id, safe_name, raw)
+
+@app.post("/files/upload-by-url")
+def upload_file_by_url(user_id: str = Query(...), url: str = Query(...), filename: Optional[str] = Query(None)):
+    # basic fetch with size guard
+    try:
+        req = UrlRequest(url, headers={"User-Agent": "PlanC-MemoryBot/1.0"})
+        with urlopen(req, timeout=30) as resp:
+            # Try content-length guard
+            cl = resp.headers.get("Content-Length")
+            if cl and int(cl) > settings.MAX_FILE_SIZE_MB * 1024 * 1024:
+                raise HTTPException(status_code=413, detail="Remote file too large")
+            data = resp.read(settings.MAX_FILE_SIZE_MB * 1024 * 1024 + 1)
+            if len(data) > settings.MAX_FILE_SIZE_MB * 1024 * 1024:
+                raise HTTPException(status_code=413, detail="Remote file too large")
+    except HTTPError as e:
+        raise HTTPException(status_code=400, detail=f"HTTP error fetching URL: {e.code}")
+    except URLError as e:
+        raise HTTPException(status_code=400, detail=f"URL error: {e.reason}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Failed to fetch URL")
+
+    inferred = filename or url.split("?")[0].split("/")[-1] or "remote_file"
+    safe_name = _safe_filename(inferred)
+    return _index_file_bytes(user_id, safe_name, data)
+class SaveFileToMemoryBody(BaseModel):
+    user_id: str
+    role: str
+    filename: str
+    tags: List[str] = Field(default_factory=list)
+
+@app.post("/memory/save-file")
+def save_file_to_memory(body: SaveFileToMemoryBody):
+    if body.role not in collections:
+        raise HTTPException(status_code=400, detail="Invalid role")
+
+    safe_name = _safe_filename(body.filename)
+    file_path = Path(settings.FILE_STORAGE_DIR) / safe_name
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    raw = _read_file_encrypted(file_path)
+    try:
+        text = raw.decode("utf-8", errors="ignore")
+    except Exception:
+        text = ""
+
+    if not text.strip():
+        # fallback: try extract (pdf/docx)
+        text = _extract_text(file_path) or ""
+
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="No extractable text")
+
+    # Cap how much we insert as one memory item (avoid giant records)
+    max_tokens = 1200
+    chunks = token_chunks(text, max_tokens, 50)
+    content = chunks[0] if chunks else text[:8000]
+
+    mid = str(uuid.uuid4())
+    collections[body.role].add(
+        documents=[content],
+        metadatas=[{
+            "user_id": body.user_id,
+            "tags": ",".join(body.tags + ["from_file", safe_name]),
+            "source_file": safe_name,
+            "created_at": datetime.utcnow().isoformat()
+        }],
+        ids=[mid]
+    )
+    return {"status": "success", "memory_id": mid, "source_file": safe_name, "tokens_stored_est": count_tokens(content)}
 
 # =========================
 # Context Builder (Hybrid + Feedback rerank + Token budget)
