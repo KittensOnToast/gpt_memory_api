@@ -24,20 +24,18 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 # ============================ Settings ============================
 
 class Settings(BaseSettings):
     """Env-driven config. Set SETTINGS__API_KEY in your env/Render."""
     model_config = SettingsConfigDict(env_prefix="SETTINGS__", case_sensitive=False)
     API_KEY: Optional[str] = None  # keep secrets out of code and git
-    FILE_STORAGE_DIR: str = "./storage"
+    FILE_STORAGE_DIR: str = os.getenv("STORAGE_DIR", "/data")  # persistent on Render
     MAX_FILE_SIZE_MB: int = 20
     URL_FETCH_TIMEOUT_S: int = 20
 
 settings = Settings()
 Path(settings.FILE_STORAGE_DIR).mkdir(parents=True, exist_ok=True)
-
 
 # ============================ App ============================
 
