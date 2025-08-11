@@ -1,6 +1,7 @@
 # path: app/memory_api.py
 from __future__ import annotations
 
+import os
 import base64
 import string
 import time
