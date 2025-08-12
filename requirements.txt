@@ -1,34 +1,14 @@
-# FastAPI + server
-fastapi==0.111.0
-uvicorn[standard]==0.30.1
-
-# Pydantic + settings management
-pydantic==2.7.4
-pydantic-settings==2.4.0
-
-# SQLite ORM
-sqlmodel==0.0.21
-
-# HTTP clients
-httpx>=0.27.0
-requests>=2.32.3
-
-# File handling & parsing
-pypdf==4.2.0
-python-docx==1.1.2
-python-multipart>=0.0.9
-
-# Tokenization for chunking
-tiktoken==0.7.0
-
-# Search algorithms
-rank-bm25==0.2.2
-
-# OpenAI API client
-openai>=1.30.0
-
-# Env file loader
-python-dotenv>=1.0.1
-
-# Optional crypto utilities
+fastapi
+uvicorn[standard]
+aiohttp
+python-dotenv
+pydantic
+sqlalchemy
+sqlite-utils
+numpy
+scikit-learn
+openai
+tenacity
+python-multipart
+tqdm
 
