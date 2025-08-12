@@ -29,3 +29,6 @@ openai==1.40.0
 # Retry utility (optional)
 tenacity==8.5.0
 
+sqlalchemy==2.0.32
+python-dotenv==1.0.1
+

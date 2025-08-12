@@ -1,597 +1,493 @@
-# app/memory_api.py
 from __future__ import annotations
 
-import asyncio
-import hashlib
-import json
 import os
-import re
-import uuid
-from datetime import datetime, timezone
+import json
+import hashlib
+import mimetypes
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Optional, Literal
+from secrets import compare_digest
 
-import aiohttp
 from fastapi import (
-    BackgroundTasks,
-    Depends,
     FastAPI,
-    File,
-    Form,
-    Header,
     HTTPException,
-    Request,
     UploadFile,
+    File,
+    Depends,
+    Query,
+    Path as FPath,
+    Request,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from pydantic_settings import BaseSettings
+
 from sqlalchemy import (
+    create_engine,
     Column,
-    DateTime,
     Integer,
     String,
+    DateTime,
     Text,
-    create_engine,
     select,
-    text as sql_text,
+    func,
+    delete as sqldelete,
 )
-from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError, NoResultFound
-from sqlalchemy.orm import Session, declarative_base, sessionmaker
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
-# =========================
-# Settings
-# =========================
+API_KEYS = [k.strip() for k in (
+    os.getenv("API_ACCESS_KEY") or
+    os.getenv("API_KEYS") or
+    os.getenv("API_KEY") or
+    "dev-key"
+).split(",") if k.strip()]
+DB_PATH = os.getenv("DB_PATH", "./memory.db")
+FILES_DIR = Path(os.getenv("FILES_DIR", "./files")).resolve()
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
+ALLOWED_MIME_PREFIXES = os.getenv("ALLOWED_MIME_PREFIXES", "text/,application/json").split(",")
+CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")
 
-class Settings(BaseSettings):
-    API_ACCESS_KEY: Optional[str] = None
-    DB_PATH: str = "./data/memory.sqlite"
-    FILE_STORAGE_DIR: str = "./data/files"
-    CORS_ALLOW_ORIGINS: Optional[str] = "*"
-    APP_VERSION: str = "3.1.0"
+FILES_DIR.mkdir(parents=True, exist_ok=True)
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+app = FastAPI(title="Virtual Employee Memory API", version="0.2.1")
 
-settings = Settings()
-os.makedirs(os.path.dirname(settings.DB_PATH), exist_ok=True)
-os.makedirs(settings.FILE_STORAGE_DIR, exist_ok=True)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
 
-# =========================
-# Database (SQLite)
-# =========================
-
+en gine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 Base = declarative_base()
-engine: Engine = create_engine(
-    f"sqlite:///{settings.DB_PATH}",
-    connect_args={"check_same_thread": False},
-    future=True,
-)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
 
 class MemoryORM(Base):
     __tablename__ = "memories"
-    id = Column(String(64), primary_key=True)
-    user_id = Column(String(128), index=True, nullable=False)
-    role = Column(String(128), index=True, nullable=False)
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String, index=True, nullable=False)
+    role = Column(String, index=True, nullable=False)
     content = Column(Text, nullable=False)
-    tags = Column(Text, nullable=True)  # JSON list
-    created_at = Column(DateTime, nullable=False, index=True)
+    tags = Column(Text, default="[]")
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 
 class FileORM(Base):
     __tablename__ = "files"
-    id = Column(String(64), primary_key=True)
-    user_id = Column(String(128), index=True, nullable=False)
-    filename = Column(String(512), nullable=False)
-    stored_path = Column(String(1024), nullable=False)
-    size = Column(Integer, nullable=False)
-    created_at = Column(DateTime, nullable=False, index=True)
-    sha256 = Column(String(64), nullable=False, index=True)
-    mime = Column(String(128), nullable=True)
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String, index=True, nullable=False)
+    original_name = Column(String, nullable=False)
+    stored_path = Column(String, nullable=False)
+    mime_type = Column(String, nullable=True)
+    sha256 = Column(String, index=True)
+    size_bytes = Column(Integer)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
-Base.metadata.create_all(engine)
 
-# =========================
-# Models
-# =========================
+class JobORM(Base):
+    __tablename__ = "jobs"
+    id = Column(Integer, primary_key=True)
+    kind = Column(String, index=True)
+    status = Column(String, index=True, default="queued")
+    input = Column(Text)
+    result = Column(Text)
+    progress = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-class Healthz(BaseModel):
-    ok: bool = True
-    version: str
-    bm25: bool = True
-    embeddings: str = "openai"
 
 class MemoryItem(BaseModel):
     user_id: str
     role: str
     content: str
+    tags: List[str] = Field(default_factory=list)
+
+
+class MemoryUpdate(BaseModel):
+    content: Optional[str] = None
     tags: Optional[List[str]] = None
 
-class SaveMemoryResponse(BaseModel):
-    id: str
-    stored: bool
-
-class ScoreComponents(BaseModel):
-    lexical: float = 0.0
-    semantic: float = 0.0
-    feedback: float = 0.0
-
-class QueryDoc(BaseModel):
-    id: str
-    user_id: str
-    role: str
-    content: str
-    tags: Optional[List[str]] = None
-    created_at: str
-
-class QueryMatch(BaseModel):
-    doc: QueryDoc
-    score: float
-    score_components: ScoreComponents
-    highlight: Optional[str] = None
 
 class QueryItem(BaseModel):
     user_id: str
     role: str
     query: str
-    top_k: int = Field(3, ge=1, le=50)
-    mode: str = Field("lexical", pattern="^(lexical|semantic|hybrid)$")
+    mode: Literal["lexical", "semantic", "hybrid"] = "lexical"
+    limit: int = 20
+    offset: int = 0
+    since: Optional[datetime] = None
+    until: Optional[datetime] = None
 
-class QueryResponse(BaseModel):
-    matches: List[QueryMatch] = []
 
-class IngestUrlRequest(BaseModel):
-    user_id: str
-    role: str
-    url: str
-    tags: Optional[List[str]] = None
+class QueryHit(BaseModel):
+    id: int
+    content: str
+    created_at: datetime
+    score: float
+    snippet: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
 
-class IngestJobResponse(BaseModel):
-    job_id: str
+
+class JobCreate(BaseModel):
+    kind: str
+    payload: dict = Field(default_factory=dict)
+
+
+class JobView(BaseModel):
+    id: int
+    kind: str
     status: str
+    progress: int
+    result: Optional[dict] = None
 
-class JobCounts(BaseModel):
-    total: int = 0
-    done: int = 0
-    skipped: int = 0
 
-class JobStatus(BaseModel):
-    job_id: str
-    status: str  # queued|running|done|error
-    progress: float
-    counts: JobCounts
-    created_at: str
-    error: Optional[str] = None
-
-class FileMeta(BaseModel):
-    id: str
-    user_id: str
-    filename: str
-    stored_path: str
-    size: int
-    created_at: str
-    sha256: str
-    mime: Optional[str] = None
-
-class FilesUploadResponse(BaseModel):
-    status: str
-    count: int
-    files: List[FileMeta]
-    saved_memories: Optional[List[str]] = None
-
-# =========================
-# Auth
-# =========================
-
-def _parse_bearer(auth_header: Optional[str]) -> Optional[str]:
-    if not auth_header:
-        return None
-    parts = auth_header.strip().split(None, 1)
-    if len(parts) == 2 and parts[0].lower() == "bearer":
-        return parts[1]
-    return None
-
-def require_api_key(
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
-):
-    required = settings.API_ACCESS_KEY
-    if not required:
-        return
-    supplied = x_api_key or _parse_bearer(authorization)
-    if not supplied:
-        raise HTTPException(status_code=401, detail="Missing API credentials")
-    if supplied != required:
-        raise HTTPException(status_code=403, detail="Invalid API credentials")
-
-# =========================
-# App + CORS
-# =========================
-
-app = FastAPI(title="Plan C GPT Memory API", version=settings.APP_VERSION)
-
-if settings.CORS_ALLOW_ORIGINS:
-    origins = (
-        ["*"] if settings.CORS_ALLOW_ORIGINS.strip() == "*"
-        else [o.strip() for o in settings.CORS_ALLOW_ORIGINS.split(",") if o.strip()]
+def require_api_key(request: Request):
+    supplied = (
+        request.headers.get("X-API-Key")
+        or (request.headers.get("Authorization") or "").removeprefix("Bearer ")
     )
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=origins,
-        allow_credentials=False,
-        allow_methods=["*"],
-        allow_headers=["*"],
-        max_age=600,
-    )
+    for valid in API_KEYS:
+        if supplied and compare_digest(supplied, valid):
+            return True
+    raise HTTPException(status_code=403, detail="Invalid API credentials")
 
-# =========================
-# Helpers
-# =========================
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-def _now_iso() -> str:
-    return _utcnow().replace(microsecond=0).isoformat()
-
-def _mask(token: Optional[str]) -> Optional[str]:
-    if not token:
-        return None
-    if len(token) <= 6:
-        return "***"
-    return f"{token[:3]}...{token[-3:]}"
-
-def _highlight_snippet(text_: str, query: str, radius: int = 60) -> str:
+def get_db() -> Session:
+    db = SessionLocal()
     try:
-        m = re.search(re.escape(query), text_, re.IGNORECASE)
-        if not m:
-            return text_[:radius] + ("..." if len(text_) > radius else "")
-        start = max(0, m.start() - radius // 2)
-        end = min(len(text_), m.end() + radius // 2)
-        return text_[start:end]
-    except re.error:
-        return text_[:radius]
+        yield db
+    finally:
+        db.close()
 
-def _sha256_bytes(b: bytes) -> str:
+
+def sha256_bytes(data: bytes) -> str:
     h = hashlib.sha256()
-    h.update(b)
+    h.update(data)
     return h.hexdigest()
 
-def _store_upload(user_id: str, upload: UploadFile) -> Tuple[FileORM, bytes]:
-    suffix = Path(upload.filename or "file.bin").suffix
-    file_id = str(uuid.uuid4())
-    safe_name = Path(upload.filename or "file").name
-    folder = Path(settings.FILE_STORAGE_DIR)
-    folder.mkdir(parents=True, exist_ok=True)
-    dest = folder / f"{file_id}{suffix}"
 
-    data = upload.file.read()
-    sha = _sha256_bytes(data)
+def json_dumps(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
-    with open(dest, "wb") as f:
-        f.write(data)
 
-    meta = FileORM(
-        id=file_id,
-        user_id=user_id,
-        filename=safe_name,
-        stored_path=str(dest),
-        size=len(data),
-        created_at=_utcnow(),
-        sha256=sha,
-        mime=upload.content_type or None,
+def json_loads(text: str):
+    try:
+        return json.loads(text)
+    except Exception:
+        return []
+
+
+Base.metadata.create_all(engine)
+
+with engine.begin() as conn:
+    conn.exec_driver_sql(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+            content,
+            user_id,
+            role,
+            created_at UNINDEXED,
+            tags,
+            content='memories',
+            content_rowid='id'
+        );
+        """
     )
-    return meta, data
+    conn.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+            INSERT INTO memories_fts(rowid, content, user_id, role, created_at, tags)
+            VALUES (new.id, new.content, new.user_id, new.role, new.created_at, COALESCE(new.tags,''));
+        END;
+        """
+    )
+    conn.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+            INSERT INTO memories_fts(memories_fts, rowid, content) VALUES('delete', old.id, old.content);
+        END;
+        """
+    )
+    conn.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+            INSERT INTO memories_fts(memories_fts, rowid, content) VALUES('delete', old.id, old.content);
+            INSERT INTO memories_fts(rowid, content, user_id, role, created_at, tags)
+            VALUES (new.id, new.content, new.user_id, new.role, new.created_at, COALESCE(new.tags,''));
+        END;
+        """
+    )
 
-# =========================
-# Debug / Meta
-# =========================
 
-@app.get("/", tags=["meta"])
-def root() -> Dict[str, Any]:
+@app.get("/healthz")
+def healthz(db: Session = Depends(get_db)):
+    db.scalar(select(func.count(MemoryORM.id)))
     return {
-        "name": "Plan C GPT Memory API",
-        "version": settings.APP_VERSION,
-        "auth": "X-API-Key or Authorization: Bearer",
-        "docs": "/docs",
+        "ok": True,
+        "fts": True,
+        "db": str(Path(DB_PATH).resolve()),
+        "cors": CORS_ALLOW_ORIGINS,
+        "version": app.version,
     }
 
-@app.get("/healthz", response_model=Healthz, tags=["meta"])
-def healthz() -> Healthz:
-    return Healthz(ok=True, version=settings.APP_VERSION, bm25=True, embeddings="openai")
 
-@app.get("/debug/auth", tags=["debug"])
-def debug_auth(
-    request: Request,
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
-):
+@app.post("/memory/save", dependencies=[Depends(require_api_key)])
+def save_memory(item: MemoryItem, db: Session = Depends(get_db)):
+    m = MemoryORM(
+        user_id=item.user_id,
+        role=item.role,
+        content=item.content,
+        tags=json_dumps(item.tags),
+    )
+    db.add(m)
+    db.commit()
+    db.refresh(m)
+    return {"id": m.id, "created_at": m.created_at}
+
+
+@app.get("/memory/{mem_id}", dependencies=[Depends(require_api_key)])
+def get_memory(mem_id: int = FPath(..., ge=1), db: Session = Depends(get_db)):
+    m = db.get(MemoryORM, mem_id)
+    if not m:
+        raise HTTPException(status_code=404, detail="Memory not found")
     return {
-        "api_key_required": bool(settings.API_ACCESS_KEY),
-        "received": {
-            "x_api_key": _mask(x_api_key),
-            "authorization_bearer": _mask(_parse_bearer(authorization)),
-        },
+        "id": m.id,
+        "user_id": m.user_id,
+        "role": m.role,
+        "content": m.content,
+        "tags": json_loads(m.tags),
+        "created_at": m.created_at,
+        "updated_at": m.updated_at,
     }
 
-@app.get("/debug/key-hash", tags=["debug"])
-def debug_key_hash():
-    if not settings.API_ACCESS_KEY:
-        return {"configured": False, "sha256": None}
-    return {"configured": True, "sha256": hashlib.sha256(settings.API_ACCESS_KEY.encode()).hexdigest()}
 
-# =========================
-# Memory: save / query
-# =========================
+@app.put("/memory/{mem_id}", dependencies=[Depends(require_api_key)])
+def update_memory(mem_id: int, patch: MemoryUpdate, db: Session = Depends(get_db)):
+    m = db.get(MemoryORM, mem_id)
+    if not m:
+        raise HTTPException(status_code=404, detail="Memory not found")
+    if patch.content is not None:
+        m.content = patch.content
+    if patch.tags is not None:
+        m.tags = json_dumps(patch.tags)
+    db.commit()
+    return {"ok": True}
 
-@app.post("/memory/save", response_model=SaveMemoryResponse, dependencies=[Depends(require_api_key)], tags=["memory"])
-def save_memory(item: MemoryItem) -> SaveMemoryResponse:
-    mem_id = str(uuid.uuid4())
-    created = _utcnow()
-    try:
-        with SessionLocal() as s:
-            s.add(
-                MemoryORM(
-                    id=mem_id,
-                    user_id=item.user_id,
-                    role=item.role,
-                    content=item.content,
-                    tags=json.dumps(item.tags or []),
-                    created_at=created,
-                )
-            )
-            s.commit()
-    except SQLAlchemyError as e:
-        raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
-    return SaveMemoryResponse(id=mem_id, stored=True)
 
-@app.post("/memory/query", response_model=QueryResponse, dependencies=[Depends(require_api_key)], tags=["memory"])
-def query_memory(q: QueryItem) -> QueryResponse:
-    like = f"%{q.query}%"
-    rows: List[MemoryORM] = []
-    try:
-        with SessionLocal() as s:
-            stmt = sql_text(
-                """
-                SELECT id, user_id, role, content, tags, created_at
-                FROM memories
-                WHERE user_id = :user_id
-                  AND role = :role
-                  AND content LIKE :like
-                ORDER BY created_at DESC
-                LIMIT :limit
-                """
-            )
-            res = s.execute(
-                stmt,
-                {"user_id": q.user_id, "role": q.role, "like": like, "limit": int(q.top_k)},
-            )
-            for r in res:
-                rows.append(
-                    MemoryORM(
-                        id=r.id,
-                        user_id=r.user_id,
-                        role=r.role,
-                        content=r.content,
-                        tags=r.tags,
-                        created_at=r.created_at,
-                    )
-                )
-    except SQLAlchemyError as e:
-        raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
+@app.delete("/memory/{mem_id}", dependencies=[Depends(require_api_key)])
+def delete_memory(mem_id: int, db: Session = Depends(get_db)):
+    result = db.execute(sqldelete(MemoryORM).where(MemoryORM.id == mem_id))
+    db.commit()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Memory not found")
+    return {"ok": True}
 
-    matches: List[QueryMatch] = []
+
+@app.post("/memory/query", response_model=List[QueryHit], dependencies=[Depends(require_api_key)])
+def query_memory(q: QueryItem, db: Session = Depends(get_db)):
+    return _fts_search(db, q)
+
+
+def _fts_search(db: Session, q: QueryItem) -> List[QueryHit]:
+    match = q.query.replace("\"", " ")
+    params = {"user_id": q.user_id, "role": q.role, "limit": q.limit, "offset": q.offset, "match": match}
+    date_clause = ""
+    if q.since:
+        params["since"] = q.since
+        date_clause += " AND m.created_at >= :since"
+    if q.until:
+        params["until"] = q.until
+        date_clause += " AND m.created_at <= :until"
+    sql = f"""
+        SELECT m.id, m.content, m.created_at, m.tags,
+               bm25(memories_fts) AS score,
+               snippet(memories_fts, 0, '[', ']', ' … ', 8) AS snip
+        FROM memories_fts
+        JOIN memories m ON m.id = memories_fts.rowid
+        WHERE memories_fts.user_id=:user_id AND memories_fts.role=:role AND memories_fts MATCH :match{date_clause}
+        ORDER BY score LIMIT :limit OFFSET :offset
+    """
+    rows = db.execute(sql, params).fetchall()
+    hits: List[QueryHit] = []
     for r in rows:
-        try:
-            tags_list = json.loads(r.tags) if r.tags else None
-        except Exception:
-            tags_list = None
-        doc = QueryDoc(
-            id=r.id,
-            user_id=r.user_id,
-            role=r.role,
-            content=r.content,
-            tags=tags_list,
-            created_at=r.created_at.replace(microsecond=0).isoformat(),
-        )
-        matches.append(
-            QueryMatch(
-                doc=doc,
-                score=1.0,
-                score_components=ScoreComponents(lexical=1.0, semantic=0.0, feedback=0.0),
-                highlight=_highlight_snippet(r.content, q.query),
+        hits.append(
+            QueryHit(
+                id=r[0],
+                content=r[1],
+                created_at=r[2],
+                tags=json_loads(r[3] or "[]"),
+                score=float(r[4]) if r[4] is not None else 0.0,
+                snippet=r[5],
             )
         )
-    return QueryResponse(matches=matches)
+    return hits
 
-# =========================
-# Files: upload / download
-# =========================
 
-@app.post(
-    "/files/upload",
-    response_model=FilesUploadResponse,
-    dependencies=[Depends(require_api_key)],
-    tags=["files"],
-)
+@app.post("/files/upload", dependencies=[Depends(require_api_key)])
 async def upload_files(
-    background: BackgroundTasks,
-    user_id: str = Form(...),
-    role: Optional[str] = Form(None),
-    save_to_memory: bool = Form(False),
-    tags: Optional[str] = Form(None),  # comma-separated
-    file: Optional[UploadFile] = File(None),
-    files: Optional[List[UploadFile]] = File(None),
-    attachment: Optional[UploadFile] = File(None),
-    attachments: Optional[List[UploadFile]] = File(None),
+    user_id: str = Query(...),
+    uploads: List[UploadFile] = File(...),
+    ingest: bool = Query(False),
+    db: Session = Depends(get_db),
 ):
-    uploads: List[UploadFile] = []
-    for x in (file, attachment):
-        if x:
-            uploads.append(x)
-    for lst in (files or [], attachments or []):
-        uploads.extend(lst)
-    if not uploads:
-        raise HTTPException(status_code=400, detail="No files provided")
+    saved = []
+    max_bytes = MAX_UPLOAD_MB * 1024 * 1024
+    for upl in uploads:
+        data = await upl.read()
+        if len(data) > max_bytes:
+            raise HTTPException(status_code=413, detail=f"File too large (>{MAX_UPLOAD_MB}MB)")
+        mime = upl.content_type or mimetypes.guess_type(upl.filename or "")[0] or "application/octet-stream"
+        if not any(mime.startswith(pfx) for pfx in ALLOWED_MIME_PREFIXES):
+            raise HTTPException(status_code=415, detail=f"MIME not allowed: {mime}")
+        digest = sha256_bytes(data)
+        safe_name = Path(upl.filename or f"upload-{digest[:8]}").name
+        dest = FILES_DIR / f"{digest[:8]}-{safe_name}"
+        with open(dest, "wb") as f:
+            f.write(data)
+        rec = FileORM(
+            user_id=user_id,
+            original_name=safe_name,
+            stored_path=str(dest),
+            mime_type=mime,
+            sha256=digest,
+            size_bytes=len(data),
+        )
+        db.add(rec)
+        db.commit()
+        db.refresh(rec)
+        saved.append({"id": rec.id, "name": safe_name, "bytes": rec.size_bytes})
+        if ingest and mime.startswith("text/"):
+            job_payload = {"file_id": rec.id, "user_id": user_id}
+            _enqueue_job(db, kind="ingest", payload=job_payload)
+    return {"saved": saved}
 
-    tag_list = [t.strip() for t in (tags.split(",") if tags else []) if t.strip()] or None
-    saved_files: List[FileMeta] = []
-    saved_memory_ids: List[str] = []
 
-    with SessionLocal() as s:
+@app.get("/files/{file_id}", dependencies=[Depends(require_api_key)])
+def download_file(file_id: int, db: Session = Depends(get_db)):
+    rec = db.get(FileORM, file_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(rec.stored_path, filename=rec.original_name, media_type=rec.mime_type)
+
+
+@app.post("/jobs", response_model=JobView, dependencies=[Depends(require_api_key)])
+def create_job(req: JobCreate, db: Session = Depends(get_db)):
+    job = _enqueue_job(db, req.kind, req.payload)
+    return _job_to_view(job)
+
+
+@app.get("/jobs/{job_id}", response_model=JobView, dependencies=[Depends(require_api_key)])
+def get_job(job_id: int, db: Session = Depends(get_db)):
+    job = db.get(JobORM, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return _job_to_view(job)
+
+
+def _enqueue_job(db: Session, kind: str, payload: dict) -> JobORM:
+    job = JobORM(kind=kind, status="queued", progress=0, input=json_dumps(payload))
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    _run_job(job.id)
+    return job
+
+
+def _run_job(job_id: int):
+    with engine.begin() as conn:
+        job = conn.exec_driver_sql("SELECT id, kind, input FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if not job:
+            return
+        kind = job[1]
+        payload = json.loads(job[2]) if job[2] else {}
+        conn.exec_driver_sql("UPDATE jobs SET status='running', progress=5, updated_at=CURRENT_TIMESTAMP WHERE id=?", (job_id,))
         try:
-            for up in uploads:
-                meta, data = _store_upload(user_id, up)
-                s.add(meta)
-                s.commit()
+            if kind == "ingest":
+                file_id = int(payload["file_id"])  # type: ignore
+                user_id = str(payload["user_id"])  # type: ignore
+                _job_ingest_text(conn, job_id, file_id, user_id)
+            conn.exec_driver_sql("UPDATE jobs SET status='done', progress=100, updated_at=CURRENT_TIMESTAMP WHERE id=?", (job_id,))
+        except Exception as e:
+            conn.exec_driver_sql(
+                "UPDATE jobs SET status='error', result=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (json_dumps({"error": str(e)}), job_id),
+            )
 
-                saved_files.append(
-                    FileMeta(
-                        id=meta.id,
-                        user_id=meta.user_id,
-                        filename=meta.filename,
-                        stored_path=meta.stored_path,
-                        size=meta.size,
-                        created_at=meta.created_at.replace(microsecond=0).isoformat(),
-                        sha256=meta.sha256,
-                        mime=meta.mime,
-                    )
-                )
 
-                if save_to_memory:
-                    mem_id = str(uuid.uuid4())
-                    content_text = data.decode("utf-8", errors="ignore")
-                    s.add(
-                        MemoryORM(
-                            id=mem_id,
-                            user_id=user_id,
-                            role=role or "files",
-                            content=content_text[:20000],  # guard against huge payload
-                            tags=json.dumps(tag_list or ["uploaded_file", up.filename or "file"]),
-                            created_at=_utcnow(),
-                        )
-                    )
-                    s.commit()
-                    saved_memory_ids.append(mem_id)
-        except SQLAlchemyError as e:
-            s.rollback()
-            raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
+def _job_ingest_text(conn, job_id: int, file_id: int, user_id: str):
+    rec = conn.exec_driver_sql("SELECT stored_path FROM files WHERE id=?", (file_id,)).fetchone()
+    if not rec:
+        raise RuntimeError("file not found for ingest")
+    path = rec[0]
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        lines = f.readlines()
+    total = max(1, len(lines))
+    tag = f"file:{file_id}"
+    for idx, line in enumerate(lines, start=1):
+        text = line.strip()
+        if not text:
+            continue
+        conn.exec_driver_sql(
+            "INSERT INTO memories(user_id, role, content, tags, created_at, updated_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            (user_id, "system", text, json_dumps([tag])),
+        )
+        if idx % 20 == 0:
+            pct = int(5 + (idx / total) * 90)
+            conn.exec_driver_sql("UPDATE jobs SET progress=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (pct, job_id))
 
-    return FilesUploadResponse(
-        status="ok",
-        count=len(saved_files),
-        files=saved_files,
-        saved_memories=(saved_memory_ids or None),
+
+def _job_to_view(job: JobORM) -> JobView:
+    return JobView(
+        id=job.id,
+        kind=job.kind,
+        status=job.status,
+        progress=job.progress,
+        result=json.loads(job.result) if job.result else None,
     )
 
-@app.get(
-    "/files/{id}",
-    dependencies=[Depends(require_api_key)],
-    tags=["files"],
-    responses={200: {"content": {"application/octet-stream": {}}}},
-)
-def download_file(id: str):
-    with SessionLocal() as s:
-        fo = s.get(FileORM, id)
-        if not fo:
-            raise HTTPException(status_code=404, detail="Not found")
-        path = Path(fo.stored_path)
-        if not path.exists():
-            raise HTTPException(status_code=404, detail="Stored file missing")
-        return FileResponse(path, filename=fo.filename, media_type=fo.mime or "application/octet-stream")
 
-# =========================
-# Ingest from URL + Jobs
-# =========================
+def compute_embedding(text: str) -> List[float]:
+    return []
 
-_JOBS: Dict[str, Dict[str, Any]] = {}
-_JOBS_LOCK = asyncio.Lock()
 
-async def _run_ingest_job(job_id: str, file_id: str):
-    try:
-        async with _JOBS_LOCK:
-            job = _JOBS[job_id]
-            job["status"] = "running"
-            job["progress"] = 0.1
+@app.get("/memory", dependencies=[Depends(require_api_key)])
+def list_memories(
+    user_id: str = Query(...),
+    role: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    since: Optional[datetime] = Query(None),
+    until: Optional[datetime] = Query(None),
+    db: Session = Depends(get_db),
+):
+    q = select(MemoryORM).where(MemoryORM.user_id == user_id)
+    if role:
+        q = q.where(MemoryORM.role == role)
+    if since:
+        q = q.where(MemoryORM.created_at >= since)
+    if until:
+        q = q.where(MemoryORM.created_at <= until)
+    q = q.order_by(MemoryORM.created_at.desc()).limit(limit).offset(offset)
+    rows = db.execute(q).scalars().all()
+    return [
+        {
+            "id": m.id,
+            "user_id": m.user_id,
+            "role": m.role,
+            "content": m.content,
+            "tags": json_loads(m.tags),
+            "created_at": m.created_at,
+            "updated_at": m.updated_at,
+        }
+        for m in rows
+    ]
 
-        # Simulate embedding/indexing work
-        for i in range(1, 6):
-            await asyncio.sleep(0.4)
-            async with _JOBS_LOCK:
-                job = _JOBS[job_id]
-                job["progress"] = min(0.1 + i * 0.15, 0.95)
-                job["counts"]["done"] = i
 
-        async with _JOBS_LOCK:
-            job = _JOBS[job_id]
-            job["status"] = "done"
-            job["progress"] = 1.0
-    except Exception as e:
-        async with _JOBS_LOCK:
-            job = _JOBS.get(job_id)
-            if job:
-                job["status"] = "error"
-                job["error"] = str(e)
-
-@app.post(
-    "/memory/ingest",
-    response_model=IngestJobResponse,
-    dependencies=[Depends(require_api_key)],
-    tags=["files", "memory"],
-)
-async def ingest_url(body: IngestUrlRequest, background: BackgroundTasks):
-    # fetch the URL, store as a file record, then kick off a background job
-    try:
-        async with aiohttp.ClientSession(raise_for_status=True) as sess:
-            async with sess.get(body.url) as resp:
-                data = await resp.read()
-                mime = resp.headers.get("Content-Type")
-                filename = body.url.split("/")[-1] or "downloaded"
-                # wrap into UploadFile-like interface for reuse
-                class _Buf:
-                    def __init__(self, b: bytes): self._b = b
-                    def read(self) -> bytes: return self._b
-                upload_like = UploadFile(filename=filename, file=_Buf(data), content_type=mime)
-
-        with SessionLocal() as s:
-            meta, _ = _store_upload(body.user_id, upload_like)
-            s.add(meta)
-            s.commit()
-
-        job_id = str(uuid.uuid4())
-        async with _JOBS_LOCK:
-            _JOBS[job_id] = {
-                "job_id": job_id,
-                "file_id": meta.id,
-                "status": "queued",
-                "progress": 0.0,
-                "counts": {"total": 5, "done": 0, "skipped": 0},
-                "created_at": _now_iso(),
-                "error": None,
-            }
-        background.add_task(_run_ingest_job, job_id, meta.id)
-        return IngestJobResponse(job_id=job_id, status="queued")
-    except aiohttp.ClientResponseError as e:
-        raise HTTPException(status_code=400, detail=f"Fetch failed: {e.status} {e.message}")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Fetch failed: {e}")
-
-@app.get("/jobs/{job_id}", response_model=JobStatus, tags=["jobs"])
-async def get_job_status(job_id: str):
-    async with _JOBS_LOCK:
-        job = _JOBS.get(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="Not found")
-        return JobStatus(
-            job_id=job["job_id"],
-            status=job["status"],
-            progress=float(job["progress"]),
-            counts=JobCounts(**job["counts"]),
-            created_at=job["created_at"],
-            error=job.get("error"),
-        )
-
+@app.get("/debug/key-hash")
+def debug_key_hash():
+    return {"keys_configured": len(API_KEYS)}
 
