@@ -11,6 +11,7 @@ from pydantic_settings import BaseSettings
 from typing import List, Optional, Dict, Any, Tuple
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 from pathlib import Path
+from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 import os
 import base64
