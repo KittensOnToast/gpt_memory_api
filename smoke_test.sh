@@ -1,128 +1,127 @@
 #!/usr/bin/env bash
+# path: smoke_test.sh
 set -euo pipefail
 
-# Default base URL (can be overridden by --base-url)
-BASE_URL="http://127.0.0.1:8080"
-
-# Parse optional --base-url flag
-if [[ "${1:-}" == "--base-url" && -n "${2:-}" ]]; then
-  BASE_URL="$2"
-  shift 2
+# --- config / env ---
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . ./.env
+  set +a
 fi
 
-API_KEY_FILE=".apikey"
+API_URL="${API_URL:-http://localhost:8001}"
+API_KEY="${API_ACCESS_KEY:-${API_KEY:-}}"
+USER_ID="${USER_ID:-u123}"
+ROLE="${ROLE:-ops}"
+QUERY="${QUERY:-deployment guide}"
+TOP_K="${TOP_K:-3}"
 
-# Ensure .apikey exists and is not empty
-if [[ ! -f "$API_KEY_FILE" ]]; then
-  echo "❌ ERROR: .apikey file not found."
-  exit 1
-fi
-API_KEY="$(cat "$API_KEY_FILE")"
-if [[ -z "$API_KEY" ]]; then
-  echo "❌ ERROR: .apikey is empty."
-  exit 1
-fi
-
-# Quick auth check
-AUTH_CHECK=$(curl -s -o /dev/null -w "%{http_code}" -H "x-api-key: $API_KEY" "$BASE_URL/healthz")
-if [[ "$AUTH_CHECK" != "200" ]]; then
-  echo "❌ ERROR: API key rejected by $BASE_URL (HTTP $AUTH_CHECK)."
+if [ -z "${API_KEY}" ]; then
+  echo "❌ Missing API key. Set API_ACCESS_KEY (or API_KEY) in .env or env." >&2
   exit 1
 fi
 
-echo "✅ API key check passed. Running smoke tests against $BASE_URL..."
+pp() { python -m json.tool 2>/dev/null || cat; }
 
-echo "=== 1) Health check (no auth) ==="
-curl -s "$BASE_URL/healthz" | jq .
+# --- helpers ---
+http_json() {
+  # $1: method, $2: url, $3: json-body (optional)
+  local m="$1" u="$2" b="${3:-}"
+  if [ -n "$b" ]; then
+    curl -sS -w '\n%{http_code}' -X "$m" "$u" \
+      -H "x-api-key: $API_KEY" -H "content-type: application/json" \
+      -d "$b"
+  else
+    curl -sS -w '\n%{http_code}' -X "$m" "$u" \
+      -H "x-api-key: $API_KEY"
+  fi
+}
 
-echo "=== 2) File upload (multipart) ==="
-echo "test file content" > test1.txt
-curl -s -X POST "$BASE_URL/files/upload?user_id=testuser" \
-  -H "x-api-key: $API_KEY" \
-  -F "file=@test1.txt" | tee upload_multipart.json | jq .
+show_or_die() {
+  # expects combined output from http_json
+  local res="$1"
+  local code body
+  code="$(echo "$res" | tail -n1)"
+  body="$(echo "$res" | sed '$d')"
+  echo "$body" | pp || true
+  if [ "$code" != "200" ]; then
+    echo "❌ HTTP $code" >&2
+    exit 1
+  fi
+  printf '%s' "$body"
+}
 
-echo "=== 3) File upload (JSON base64) ==="
-if base64 --help 2>&1 | grep -q -- " -w "; then
-  B64_CONTENT=$(base64 -w 0 test1.txt)
-else
-  B64_CONTENT=$(base64 < test1.txt | tr -d '\n')
-fi
-curl -s -X POST "$BASE_URL/files/upload-json" \
-  -H "x-api-key: $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d "{\"user_id\":\"testuser\",\"filename\":\"test2.txt\",\"content_base64\":\"$B64_CONTENT\"}" \
-  | tee upload_json.json | jq .
+json_get() {
+  # read JSON from stdin, extract a key (simple path)
+  python - "$1" <<'PY'
+import sys, json
+data=json.loads(sys.stdin.read())
+key=sys.argv[1]
+# support one-level or nested a.b.c
+cur=data
+for part in key.split('.'):
+    cur=cur[part]
+print(cur)
+PY
+}
 
-echo "=== 4) File upload (URL - GitHub raw) ==="
-curl -s -X POST "$BASE_URL/files/upload-url" \
-  -H "x-api-key: $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"user_id":"testuser","url":"https://raw.githubusercontent.com/github/gitignore/main/Python.gitignore","filename":"remote.txt"}' \
-  | tee upload_url.json | jq .
+# --- wait for healthz ---
+echo "▶ wait: /healthz at $API_URL"
+for i in {1..20}; do
+  set +e
+  res=$(curl -s -o /dev/null -w '%{http_code}' -H "x-api-key: $API_KEY" "$API_URL/healthz")
+  rc=$?
+  set -e
+  if [ "$rc" -eq 0 ] && [ "$res" = "200" ]; then break; fi
+  sleep 0.5
+done
 
-echo "=== 5) List files ==="
-curl -s "$BASE_URL/files/list?user_id=testuser" -H "x-api-key: $API_KEY" | jq .
+# --- 1) healthz ---
+echo "▶ 1) /healthz"
+show_or_die "$(http_json GET "$API_URL/healthz")" >/dev/null
 
-echo "=== 6) Download file ==="
-curl -s -O -J "$BASE_URL/files/download/test1.txt" -H "x-api-key: $API_KEY" && echo "Downloaded test1.txt ✅"
+# --- 2) save ---
+echo "▶ 2) /memory/save"
+SAVE_BODY=$(printf '{"user_id":"%s","role":"%s","content":"The deploy playbook is at /runbook.","tags":["runbook","deploy"]}' "$USER_ID" "$ROLE")
+SAVE_JSON="$(show_or_die "$(http_json POST "$API_URL/memory/save" "$SAVE_BODY")")"
+MEM_ID="$(printf '%s' "$SAVE_JSON" | json_get memory_id)"
+[ -n "$MEM_ID" ] || { echo "❌ no memory_id"; exit 1; }
 
-echo "=== 7) Delete file ==="
-curl -s -X DELETE "$BASE_URL/files/delete/test1.txt?user_id=testuser" -H "x-api-key: $API_KEY" | jq .
+# --- 3) lexical ---
+echo "▶ 3) /memory/query (lexical)"
+LEX_BODY=$(printf '{"user_id":"%s","role":"%s","query":"%s","top_k":%d,"mode":"lexical"}' "$USER_ID" "$ROLE" "runbook" "$TOP_K")
+show_or_die "$(http_json POST "$API_URL/memory/query" "$LEX_BODY")" >/dev/null
 
-echo "=== 8) Save memory ==="
-MEM_ID=$(curl -s -X POST "$BASE_URL/memory/save" \
-  -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
-  -d '{"user_id":"testuser","role":"assistant","content":"This is a test memory"}' \
-  | jq -r .memory_id)
-echo "Memory ID: $MEM_ID"
+# --- 4) reindex ---
+echo "▶ 4) /embed/reindex"
+REINDEX_JSON="$(show_or_die "$(http_json POST "$API_URL/embed/reindex" '{}')")"
+JOB_ID="$(printf '%s' "$REINDEX_JSON" | json_get job_id)"
+[ -n "$JOB_ID" ] || { echo "❌ no job_id"; exit 1; }
+echo "job_id=$JOB_ID"
 
-echo "=== 9) Query memory ==="
-curl -s -X POST "$BASE_URL/memory/query" \
-  -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
-  -d "{\"user_id\":\"testuser\",\"role\":\"assistant\",\"query\":\"test\",\"top_k\":3}" \
-  | jq .
+# --- 5) poll ---
+echo "▶ 5) /jobs/$JOB_ID"
+while :; do
+  JOB_JSON="$(show_or_die "$(http_json GET "$API_URL/jobs/$JOB_ID")")"
+  STATUS="$(printf '%s' "$JOB_JSON" | json_get status)"
+  if [ "$STATUS" = "done" ]; then break; fi
+  if [ "$STATUS" = "error" ]; then
+    ERR="$(printf '%s' "$JOB_JSON" | json_get error || true)"
+    echo "❌ Job error: $ERR" >&2
+    exit 1
+  fi
+  sleep 1
+done
 
-echo "=== 10) Update memory ==="
-curl -s -X POST "$BASE_URL/memory/update" \
-  -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
-  -d "{\"memory_id\":\"$MEM_ID\",\"role\":\"assistant\",\"new_content\":\"Updated content\"}" \
-  | jq .
+# --- 6) hybrid ---
+echo "▶ 6) /memory/query (hybrid)"
+HYB_BODY=$(printf '{"user_id":"%s","role":"%s","query":"%s","top_k":%d,"mode":"hybrid"}' "$USER_ID" "$ROLE" "$QUERY" "$TOP_K")
+show_or_die "$(http_json POST "$API_URL/memory/query" "$HYB_BODY")" >/dev/null
 
-echo "=== 11) Auto-query memory ==="
-curl -s -X POST "$BASE_URL/memory/auto-query" \
-  -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
-  -d "{\"user_id\":\"testuser\",\"role\":\"assistant\",\"query\":\"updated\",\"top_k\":2}" \
-  | jq .
+# --- 7) context ---
+echo "▶ 7) /context/build"
+CTX_BODY=$(printf '{"user_id":"%s","role":"%s","query":"%s","top_k":%d,"mode":"general"}' "$USER_ID" "$ROLE" "$QUERY" "$TOP_K")
+show_or_die "$(http_json POST "$API_URL/context/build" "$CTX_BODY")" >/dev/null
 
-echo "=== 12) Feedback memory ==="
-curl -s -X POST "$BASE_URL/memory/feedback" \
-  -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
-  -d "{\"memory_id\":\"$MEM_ID\",\"role\":\"assistant\",\"user_id\":\"testuser\",\"feedback_type\":\"positive\",\"feedback_text\":\"Looks good\"}" \
-  | jq .
-
-echo "=== 13) Tag search memory ==="
-curl -s -X POST "$BASE_URL/memory/tag-search" \
-  -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
-  -d '{"role":"assistant","tags":[],"top_k":3}' \
-  | jq .
-
-echo "=== 14) Self-review memory ==="
-curl -s "$BASE_URL/memory/self-review" -H "x-api-key: $API_KEY" | jq .
-
-echo "=== 15) Save goal ==="
-curl -s -X POST "$BASE_URL/memory/goals" \
-  -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
-  -d '{"user_id":"testuser","content":"My first goal"}' \
-  | jq .
-
-echo "=== 16) List goals ==="
-curl -s "$BASE_URL/memory/goals" -H "x-api-key: $API_KEY" | jq .
-
-echo "=== 17) Build context ==="
-curl -s -X POST "$BASE_URL/context/build" \
-  -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
-  -d '{"user_id":"testuser","role":"assistant","query":"updated","top_k":3,"mode":"summarise"}' \
-  | jq .
-
-echo "=== Smoke tests completed successfully ==="
-
+echo "✅ Smoke test complete."
