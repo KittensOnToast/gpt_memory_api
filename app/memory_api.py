@@ -38,7 +38,6 @@ from sqlalchemy import (
     text as sql_text,
 )
 from sqlalchemy.engine import Engine
- the
 from sqlalchemy.exc import SQLAlchemyError, NoResultFound
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
